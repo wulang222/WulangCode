@@ -1,0 +1,201 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  ConfigError,
+  getContextWindow,
+  getContextWindowAsync,
+  getMaxOutputTokens,
+  loadConfig,
+  mergeConfig,
+  resolveAPIKey,
+  _resetContextWindowCache,
+  type AppConfig,
+  type ProviderConfig,
+} from "../src/config/config.ts";
+
+const dirs: string[] = [];
+
+function writeYaml(content: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-config-"));
+  dirs.push(dir);
+  const path = join(dir, "config.yaml");
+  writeFileSync(path, content);
+  return path;
+}
+
+afterEach(() => {
+  _resetContextWindowCache();
+  while (dirs.length > 0) {
+    const dir = dirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const sample = `
+providers:
+  - name: anthropic
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-sonnet-4-5
+    api_key: test-key
+    thinking: true
+`;
+
+describe("loadConfig", () => {
+  test("合法配置返回对应条数", () => {
+    const path = writeYaml(sample);
+    const config = loadConfig(path);
+    expect(config.providers).toHaveLength(1);
+    expect(config.providers[0]?.model).toBe("claude-sonnet-4-5");
+    expect(config.providers[0]?.thinking).toBe(true);
+    expect(config.mcp_servers).toEqual([]);
+    expect(config.hooks).toEqual([]);
+  });
+
+  test("缺字段抛 ConfigError", () => {
+    const path = writeYaml(`
+providers:
+  - name: only-name
+    protocol: anthropic
+`);
+    expect(() => loadConfig(path)).toThrow(ConfigError);
+    try {
+      loadConfig(path);
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as Error).message).toContain("Provider #1: missing fields:");
+      expect((err as Error).message).toContain("model");
+    }
+  });
+
+  test("非法 protocol 抛 ConfigError", () => {
+    const path = writeYaml(`
+providers:
+  - name: bad
+    protocol: gemini
+    base_url: https://example.com
+    model: x
+`);
+    expect(() => loadConfig(path)).toThrow(ConfigError);
+    try {
+      loadConfig(path);
+    } catch (err) {
+      expect((err as Error).message).toContain("invalid protocol 'gemini'");
+    }
+  });
+
+  test("文件不存在抛 ConfigError", () => {
+    expect(() => loadConfig(join(tmpdir(), "mewcode-missing-config.yaml"))).toThrow(ConfigError);
+  });
+});
+
+describe("resolveAPIKey", () => {
+  const base: ProviderConfig = {
+    name: "anthropic",
+    protocol: "anthropic",
+    base_url: "https://api.anthropic.com",
+    model: "claude-sonnet-4-5",
+  };
+
+  test("优先使用 api_key", () => {
+    const previous = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "from-env";
+    try {
+      expect(resolveAPIKey({ ...base, api_key: "from-file" })).toBe("from-file");
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = previous;
+    }
+  });
+
+  test("缺失 api_key 时读环境变量", () => {
+    const previous = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "env-openai";
+    try {
+      expect(
+        resolveAPIKey({
+          name: "compat",
+          protocol: "openai-compat",
+          base_url: "https://example.com/v1",
+          model: "gpt-4o",
+        }),
+      ).toBe("env-openai");
+    } finally {
+      if (previous === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previous;
+    }
+  });
+
+  test("两处都缺返回空字符串", () => {
+    const previous = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      expect(resolveAPIKey(base)).toBe("");
+    } finally {
+      if (previous !== undefined) process.env.ANTHROPIC_API_KEY = previous;
+    }
+  });
+});
+
+describe("mergeConfig 与窗口推导", () => {
+  test("providers 整列覆盖，hooks 追加，mcp 按 name 合并", () => {
+    const base: AppConfig = {
+      providers: [
+        { name: "home", protocol: "anthropic", base_url: "https://api.anthropic.com", model: "old" },
+      ],
+      mcp_servers: [{ name: "a", command: "old" }, { name: "b", command: "keep" }],
+      hooks: [{ event: "start", command: "echo a" }],
+      permission_mode: "default",
+    };
+    const override: AppConfig = {
+      providers: [
+        { name: "project", protocol: "openai", base_url: "https://api.openai.com/v1", model: "gpt-4o" },
+      ],
+      mcp_servers: [{ name: "a", command: "new" }],
+      hooks: [{ event: "end", command: "echo b" }],
+    };
+    const merged = mergeConfig(base, override);
+    expect(merged.providers.map((item) => item.name)).toEqual(["project"]);
+    expect(merged.mcp_servers.find((item) => item.name === "a")?.command).toBe("new");
+    expect(merged.mcp_servers.find((item) => item.name === "b")?.command).toBe("keep");
+    expect(merged.hooks).toHaveLength(2);
+    expect(merged.permission_mode).toBe("default");
+  });
+
+  test("getMaxOutputTokens 与 getContextWindow 回退", () => {
+    const provider: ProviderConfig = {
+      name: "a",
+      protocol: "anthropic",
+      base_url: "https://api.anthropic.com",
+      model: "claude-sonnet-4-5",
+      thinking: true,
+    };
+    expect(getMaxOutputTokens(provider)).toBe(64_000);
+    expect(getMaxOutputTokens({ ...provider, max_output_tokens: 1000, thinking: false })).toBe(1000);
+    expect(getContextWindow(provider)).toBe(200_000);
+    expect(getContextWindow({ ...provider, context_window: 4096 })).toBe(4096);
+    expect(
+      getContextWindow({
+        name: "o",
+        protocol: "openai",
+        base_url: "https://api.openai.com/v1",
+        model: "unknown-model-xyz",
+      }),
+    ).toBe(128_000);
+  });
+
+  test("探测失败时降级到内置窗口，不抛错", async () => {
+    const provider: ProviderConfig = {
+      name: "a",
+      protocol: "anthropic",
+      base_url: "http://127.0.0.1:1",
+      model: "claude-sonnet-4-5",
+    };
+    const value = await getContextWindowAsync(provider, async () => {
+      throw new Error("probe failed");
+    });
+    expect(value).toBe(200_000);
+  });
+});

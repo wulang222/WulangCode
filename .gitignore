@@ -1,0 +1,5 @@
+node_modules/
+.mewcode/config.yaml
+.mewcode/config.local.yaml
+*.log
+dist/
