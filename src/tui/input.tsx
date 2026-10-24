@@ -226,7 +226,8 @@ export function InputBox({
         rememberHistory(null, null);
         return;
       }
-      if (key.tab) {
+      // Shift+Tab 留给 App 层做模式切换（plan/default），这里只处理普通 Tab。
+      if (key.tab && !key.shift) {
         const first = commandHits[0];
         if (slashQuery !== null && first) {
           const filled = `/${first.name}`;

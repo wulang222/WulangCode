@@ -3,6 +3,7 @@ import chalk from "chalk";
 import { Marked } from "marked";
 import { markedTerminal } from "marked-terminal";
 import { symbols } from "./styles.js";
+import { ToolBlock } from "./tool-display.js";
 
 chalk.level = 3;
 
@@ -10,6 +11,7 @@ export interface ChatMessage {
   id?: string;
   role: "user" | "assistant" | "system" | "thinking" | "tool_use" | "tool_result" | "turn_summary";
   content: string;
+  toolId?: string;
   toolName?: string;
   argsSummary?: string;
   isError?: boolean;
@@ -51,13 +53,28 @@ function MessageBlock({ message }: { message: ChatMessage }) {
   }
   if (message.role === "tool_use") {
     return (
-      <Text>
-        {symbols.play} {message.toolName ?? "tool"} {message.argsSummary ?? ""}
-      </Text>
+      <ToolBlock
+        info={{
+          toolName: message.toolName ?? "tool",
+          argsSummary: message.argsSummary,
+          loading: true,
+        }}
+      />
     );
   }
   if (message.role === "tool_result") {
-    return <Text>{message.isError ? symbols.cross : symbols.check} {message.content}</Text>;
+    return (
+      <ToolBlock
+        info={{
+          toolName: message.toolName ?? "tool",
+          argsSummary: message.argsSummary,
+          output: message.content,
+          isError: message.isError,
+          elapsed: message.elapsed,
+          loading: false,
+        }}
+      />
+    );
   }
   return (
     <Text dimColor>

@@ -8,10 +8,12 @@ interface SpinnerProps {
   label?: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** 当前迭代轮次（F9）：多轮循环时展示 Agent 正在第几轮推进。 */
+  iteration?: number;
 }
 
-/** 流式期间的进行中指示：动词 + token + 每秒加一的秒数。 */
-export function Spinner({ label, inputTokens = 0, outputTokens = 0 }: SpinnerProps) {
+/** 流式期间的进行中指示：动词 + 轮次 + token + 每秒加一的秒数。 */
+export function Spinner({ label, inputTokens = 0, outputTokens = 0, iteration = 0 }: SpinnerProps) {
   const [elapsed, setElapsed] = useState(0);
   const [verb] = useState(() => label ?? randomVerb());
 
@@ -29,7 +31,7 @@ export function Spinner({ label, inputTokens = 0, outputTokens = 0 }: SpinnerPro
 
   return (
     <Text>
-      <InkSpinner type="dots" /> {verb}… ({tokenPart}{elapsed}s)
+      <InkSpinner type="dots" /> {verb}… (第 {Math.max(1, iteration)} 轮 {symbols.dot} {tokenPart}{elapsed}s)
     </Text>
   );
 }

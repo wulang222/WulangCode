@@ -27,9 +27,9 @@ export function buildOpenAIInput(history: Message[]): ResponseInput {
       for (const tool of message.toolUses) {
         items.push({
           type: "function_call",
-          call_id: tool.id,
-          name: tool.name,
-          arguments: JSON.stringify(tool.input),
+          call_id: tool.toolUseId,
+          name: tool.toolName,
+          arguments: JSON.stringify(tool.arguments),
         });
       }
       continue;
@@ -59,9 +59,9 @@ export function buildChatCompletionMessages(history: Message[]): ChatCompletionM
         role: "assistant",
         content: message.content || null,
         tool_calls: message.toolUses.map((tool) => ({
-          id: tool.id,
+          id: tool.toolUseId,
           type: "function" as const,
-          function: { name: tool.name, arguments: JSON.stringify(tool.input) },
+          function: { name: tool.toolName, arguments: JSON.stringify(tool.arguments) },
         })),
       });
       continue;
@@ -157,7 +157,7 @@ export class OpenAIClient implements LLMClient, MaxTokensSetter {
   ): AsyncGenerator<StreamEvent> {
     const input: ResponseInput = [
       { role: "system", content: this.systemPrompt },
-      ...buildOpenAIInput(conv.getMessages()),
+      ...buildOpenAIInput(conv.getRequestMessages()),
     ];
     const usage: UsageInfo = emptyUsage();
     let stopReason = "end_turn";
@@ -169,7 +169,18 @@ export class OpenAIClient implements LLMClient, MaxTokensSetter {
           stream: true,
           max_output_tokens: this.maxOutputTokens,
           ...(toolSchemas.length > 0
-            ? { tools: toolSchemas as unknown as OpenAI.Responses.Tool[] }
+            ? {
+                tools: toolSchemas.map((s) => {
+                  const schema = s as { name?: string; description?: string; input_schema?: Record<string, unknown> };
+                  return {
+                    type: "function" as const,
+                    name: schema.name ?? "",
+                    description: schema.description ?? "",
+                    parameters: schema.input_schema,
+                    strict: false,
+                  };
+                }) as unknown as OpenAI.Responses.Tool[],
+              }
             : {}),
         },
         { signal: abortSignal },
@@ -256,7 +267,7 @@ export class OpenAICompatClient implements LLMClient, MaxTokensSetter {
   ): AsyncGenerator<StreamEvent> {
     const messages: ChatCompletionMessageParam[] = [
       { role: "system", content: this.systemPrompt },
-      ...buildChatCompletionMessages(conv.getMessages()),
+      ...buildChatCompletionMessages(conv.getRequestMessages()),
     ];
     const usage: UsageInfo = emptyUsage();
     let finishReason = "";
@@ -270,7 +281,21 @@ export class OpenAICompatClient implements LLMClient, MaxTokensSetter {
           stream: true,
           max_tokens: this.maxOutputTokens,
           stream_options: { include_usage: true },
-          ...(toolSchemas.length > 0 ? { tools: toolSchemas as unknown as ChatCompletionTool[] } : {}),
+          ...(toolSchemas.length > 0
+            ? {
+                tools: toolSchemas.map((s) => {
+                  const schema = s as { name?: string; description?: string; input_schema?: Record<string, unknown> };
+                  return {
+                    type: "function" as const,
+                    function: {
+                      name: schema.name ?? "",
+                      description: schema.description ?? "",
+                      parameters: schema.input_schema,
+                    },
+                };
+                }) as unknown as ChatCompletionTool[],
+              }
+            : {}),
         },
         { signal: abortSignal },
       );

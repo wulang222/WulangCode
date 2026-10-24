@@ -97,7 +97,7 @@ export function buildAnthropicMessages(history: Message[]): Anthropic.MessagePar
       if (message.content) blocks.push({ type: "text", text: message.content });
       // 3) 工具调用块
       for (const tool of message.toolUses ?? []) {
-        blocks.push({ type: "tool_use", id: tool.id, name: tool.name, input: tool.input });
+        blocks.push({ type: "tool_use", id: tool.toolUseId, name: tool.toolName, input: tool.arguments });
       }
       // 有块就用块数组，没有块就退回纯字符串（保持与原消息形式一致）。
       out.push({ role: "assistant", content: blocks.length > 0 ? blocks : message.content });
@@ -135,10 +135,11 @@ function pushUserText(out: Anthropic.MessageParam[], text: string): void {
     prev.content = `${prev.content}\n${text}`;
     return;
   }
-  // 情况 2：上一条是 user 且内容是块数组 → 若全是 text 块，追加一个 text 块。
-  if (prev?.role === "user" && Array.isArray(prev.content)) {
-    const onlyText = prev.content.every((block) => block.type === "text");
-    if (onlyText) {
+  // 情况 2：上一条是 user 且内容是块数组 → 块全为 text / tool_result 时追加一个 text 块。
+  // （tool_result 消息后跟补充提醒文本是合法组合，合并保证交替不被打断。）
+  if (prev?.role === "user" && Array.isArray(prev.content) && prev.content.length > 0) {
+    const mergeable = prev.content.every((block) => block.type === "text" || block.type === "tool_result");
+    if (mergeable) {
       prev.content.push({ type: "text", text });
       return;
     }
@@ -150,8 +151,7 @@ function pushUserText(out: Anthropic.MessageParam[], text: string): void {
 /**
  * 给最后一条普通 user 内容的最后一块打缓存标记。
  * 作用：利用 Anthropic 的 prompt caching，把这段前缀缓存起来，减少重复计费/延迟。
- */
-export function markLastUserTailForCache(messages: Anthropic.MessageParam[]): void {
+ */export function markLastUserTailForCache(messages: Anthropic.MessageParam[]): void {
   // 从后往前找最近一条 user 消息。
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
@@ -172,6 +172,54 @@ export function markLastUserTailForCache(messages: Anthropic.MessageParam[]): vo
     last.cache_control = { type: "ephemeral" };
     return;
   }
+}
+
+/** buildAnthropicParams 的入参。 */
+export interface AnthropicParamsInput {
+  model: string;
+  maxTokens: number;
+  /** 提供则开启 extended thinking，值为 budget_tokens。 */
+  thinkingBudget?: number;
+  systemPrompt: string;
+  messages: Anthropic.MessageParam[];
+  toolSchemas: Record<string, unknown>[];
+}
+
+/**
+ * 组装 MessageCreateParams（纯函数，便于单测断言缓存断点）。
+ * 三层 ephemeral 断点（F3）：system 块、工具列表末项、历史尾部 user 末块
+ * ——messages 侧的断点由 markLastUserTailForCache 预先打好。
+ */
+export function buildAnthropicParams(input: AnthropicParamsInput): Anthropic.MessageCreateParamsStreaming {
+  const params: Anthropic.MessageCreateParamsStreaming = {
+    model: input.model,
+    max_tokens: input.maxTokens,
+    stream: true,
+    // 系统提示单独传，并打 cache_control 让它也走 prompt caching。
+    system: [{ type: "text", text: input.systemPrompt, cache_control: { type: "ephemeral" } }],
+    messages: input.messages,
+  };
+  if (input.thinkingBudget !== undefined) {
+    params.thinking = { type: "enabled", budget_tokens: input.thinkingBudget };
+  }
+  if (input.toolSchemas.length > 0) {
+    const tools = input.toolSchemas.map((s) => {
+      const schema = s as { name?: string; description?: string; input_schema?: Record<string, unknown> };
+      return {
+        name: schema.name ?? "",
+        description: schema.description ?? "",
+        input_schema: {
+          type: "object",
+          properties: schema.input_schema?.properties ?? {},
+          required: schema.input_schema?.required ?? [],
+        },
+      };
+    });
+    // 工具列表末项打 ephemeral 断点：工具集变化时前缀（system + 前面的工具）仍可命中。
+    (tools[tools.length - 1] as Record<string, unknown>).cache_control = { type: "ephemeral" };
+    params.tools = tools as unknown as Anthropic.Tool[];
+  }
+  return params;
 }
 
 /**
@@ -261,8 +309,8 @@ export class AnthropicClient implements LLMClient, MaxTokensSetter {
       toolSchemas: Record<string, unknown>[],
       abortSignal?: AbortSignal,
   ): AsyncGenerator<StreamEvent> {
-    // 1) 把内部历史转成 Anthropic 消息格式，并给尾部打缓存标记。
-    const messages = buildAnthropicMessages(conv.getMessages());
+    // 1) 把内部历史（含待发补充提醒）转成 Anthropic 消息格式，并给尾部打缓存标记。
+    const messages = buildAnthropicMessages(conv.getRequestMessages());
     markLastUserTailForCache(messages);
 
     // Anthropic 要求 budget_tokens ≥ 1024，并且小于 max_tokens。
@@ -274,23 +322,15 @@ export class AnthropicClient implements LLMClient, MaxTokensSetter {
       maxTokens = budget + 1;
     }
 
-    // 2) 组装请求参数。
-    const params: Anthropic.MessageCreateParamsStreaming = {
+    // 2) 组装请求参数（system / 末 tool 断点在 buildAnthropicParams 内统一处理）。
+    const params = buildAnthropicParams({
       model: this.cfg.model,
-      max_tokens: maxTokens,
-      stream: true,
-      // 系统提示单独传，并打 cache_control 让它也走 prompt caching。
-      system: [{ type: "text", text: this.systemPrompt, cache_control: { type: "ephemeral" } }],
+      maxTokens,
+      thinkingBudget: this.cfg.thinking ? budget : undefined,
+      systemPrompt: this.systemPrompt,
       messages,
-    };
-    // 开启 extended thinking（若配置开启）。
-    if (this.cfg.thinking) {
-      params.thinking = { type: "enabled", budget_tokens: budget };
-    }
-    // 有工具定义才传 tools 字段（本章通常为空）。
-    if (toolSchemas.length > 0) {
-      params.tools = toolSchemas as unknown as Anthropic.Tool[];
-    }
+      toolSchemas,
+    });
 
     // 3) 流式状态跟踪变量（跨事件累积）。
     const usage: UsageInfo = emptyUsage();
