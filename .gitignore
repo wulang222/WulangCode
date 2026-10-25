@@ -6,3 +6,9 @@ node_modules/
 dist/
 .mewcode/sessions/
 .mewcode/tool_results/
+.mewcode/file-history/
+.mewcode/memory/
+.mewcode/prompt_history.jsonl
+.mewcode/teams/
+.mewcode/tool_results/
+.mewcode/sessions/
