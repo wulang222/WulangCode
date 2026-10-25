@@ -6,6 +6,7 @@ import { render } from "ink";
 import cliCursor from "cli-cursor";
 import { loadConfig } from "./config/config.js";
 import { App } from "./tui/app.js";
+import { parseTeammateFlags, runTeammate } from "./teammate.js";
 
 const require = createRequire(import.meta.url);
 
@@ -58,6 +59,18 @@ function restoreCursor(): void {
 }
 
 async function main(): Promise<void> {
+  // --teammate 队员模式（F55）：命中即走自治循环后直接返回，不渲染 TUI。
+  const teammateArgs = parseTeammateFlags(process.argv.slice(2));
+  if (teammateArgs) {
+    try {
+      await runTeammate(teammateArgs);
+    } catch (err) {
+      console.error(`teammate: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   let cfg;
   try {
     cfg = loadConfig();
