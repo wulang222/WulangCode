@@ -12,3 +12,4 @@ dist/
 .mewcode/teams/
 .mewcode/tool_results/
 .mewcode/sessions/
+.mewcode/command_usage.json
