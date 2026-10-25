@@ -40,9 +40,34 @@ export interface MCPServerConfig {
   env?: Record<string, string>;
 }
 
+/**
+ * 单条 Hook 声明（day10）：事件 + 可选条件 + 动作三要素。
+ * 语义校验（事件枚举、动作必填字段、reject/async 互斥）统一留给 hooks 模块的 validate，
+ * 配置层只负责字段解析与三层叠加合并（F1-F3）。
+ */
 export interface HookConfig {
+  /** 标识符：用于日志与 once 去重键；缺省退化到「事件名-动作类型」。 */
+  id?: string;
   event: string;
-  command: string;
+  /** 单行条件表达式（==/!=/=~/=* + ! 取反 + && / || 左结合）。 */
+  condition?: string;
+  action: {
+    /** "command" | "prompt" | "http" | "agent" */
+    type: string;
+    command?: string;
+    url?: string;
+    /** http 动作的方法，默认 POST。 */
+    method?: string;
+    prompt?: string;
+  };
+  /** 仅 pre_tool_use 事件下有拦截语义（F16）。 */
+  reject?: boolean;
+  /** 引擎实例内仅触发一次（F19/F20）。 */
+  once?: boolean;
+  /** 后台执行，不阻塞主流程；与 reject 互斥（F18）。 */
+  async?: boolean;
+  /** "ignore" | "fail" | "reject"，默认 ignore（F22）。 */
+  on_error?: string;
 }
 
 export interface AppConfig {
@@ -160,7 +185,26 @@ function parseHooks(raw: unknown): HookConfig[] {
       throw new ConfigError(`hooks #${index + 1} 必须是映射`);
     }
     const row = item as Record<string, unknown>;
-    return { event: asString(row.event), command: asString(row.command) };
+    const actionRow =
+      row.action && typeof row.action === "object" && !Array.isArray(row.action)
+        ? (row.action as Record<string, unknown>)
+        : {};
+    return {
+      id: asString(row.id) || undefined,
+      event: asString(row.event),
+      condition: asString(row.condition) || undefined,
+      action: {
+        type: asString(actionRow.type),
+        command: asString(actionRow.command) || undefined,
+        url: asString(actionRow.url) || undefined,
+        method: asString(actionRow.method) || undefined,
+        prompt: asString(actionRow.prompt) || undefined,
+      },
+      reject: row.reject === true ? true : undefined,
+      once: row.once === true ? true : undefined,
+      async: row.async === true ? true : undefined,
+      on_error: asString(row.on_error) || undefined,
+    };
   });
 }
 

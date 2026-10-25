@@ -42,6 +42,16 @@ import { CommandUsageTracker } from "../commands/usage-tracker.js";
 import { runSkillInline, SkillCatalog } from "../skills/catalog.js";
 import { MCPManager } from "../mcp/manager.js";
 import { MCPToolWrapper } from "../mcp/tool-wrapper.js";
+import { HookEngine, validate as validateHooks } from "../hooks/hooks.js";
+import { AgentTool } from "../agents/agent-tool.js";
+import type { AgentDefinition } from "../agents/definition.js";
+import { BUILTIN_AGENTS } from "../agents/definition.js";
+import { spawnSubAgent, type AgentEventSink } from "../agents/spawn.js";
+import { TaskManager } from "../agents/task-manager.js";
+import { TeamManager } from "../teams/team.js";
+import { coordinatorToolFilter } from "../teams/coordinator.js";
+import type { TeammateUIState } from "../teams/progress.js";
+import { ListTeamsTool, SendMessageTool, SpawnTeammateTool, TeamCreateTool, TeamDeleteTool } from "../teams/tools.js";
 import { BashTool } from "../tools/bash.js";
 import { EditFileTool } from "../tools/edit-file.js";
 import { GlobTool } from "../tools/glob.js";
@@ -57,6 +67,9 @@ import { InputBox } from "./input.js";
 import { ProviderSelect } from "./provider-select.js";
 import { Spinner } from "./spinner.js";
 import { StatusBar } from "./status-bar.js";
+import { TeamStatus } from "./team-status.js";
+import { TeamsDialog } from "./teams-dialog.js";
+import { TeammateSpinnerTree } from "./teammate-spinner-tree.js";
 import { formatArgs } from "./tool-display.js";
 import { randomCompletionVerb } from "./verbs.js";
 
@@ -137,6 +150,18 @@ interface AppProps {
 
 type AppState = "providerSelect" | "chat";
 
+/**
+ * day13（F52）：Coordinator 谓词与用户工具过滤器取「与」；
+ * 无用户过滤器时直接用 Coordinator 谓词。
+ */
+function buildComposedToolFilter(
+  coordinator: (name: string) => boolean,
+  skillFilter: ((name: string) => boolean) | null,
+): (name: string) => boolean {
+  if (!skillFilter) return coordinator;
+  return (name) => coordinator(name) && skillFilter(name);
+}
+
 function errorText(err: unknown): string {
   if (err instanceof LLMError) return `${err.name}: ${err.message}`;
   if (err instanceof Error) return err.message;
@@ -201,8 +226,19 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
   // 动态注册（用户命令 / 技能）后 bump，让补全菜单读到新命令（F40/G6）。
   const [slashCommands, setSlashCommands] = useState<Command[]>(() => cmdRegistryRef.current!.listCommands());
 
-  // 本章不使用，保留接入点，避免后续章节改 props。
-  void hooks;
+  // day10：Hook 引擎整个 App 生命周期共享一份（N3：/clear 不重置，重启才清空）。
+  const hookEngineRef = useRef<HookEngine | null>(null);
+  // day13（F56）：团队管理器 + 队员状态快照 + Teams Dialog 开关。
+  const teamManagerRef = useRef(new TeamManager(workDir));
+  const [teammateStates, setTeammateStates] = useState<TeammateUIState[]>([]);
+  const [teamsDialogOpen, setTeamsDialogOpen] = useState(false);
+  // day11：SubAgent 基础设施（T13）——任务管理器 / 团队 / Agent 工具，App 生命周期共享。
+  const taskMgrRef = useRef<TaskManager | null>(null);
+  const agentToolRef = useRef<AgentTool | null>(null);
+  const taskNotifyTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 派生 handler 在首挂载时定义一次，provider 切换后通过 ref 读当前值。
+  const selectedProviderRef = useRef<ProviderConfig | undefined>(providers[0]);
+  selectedProviderRef.current = selectedProvider;
 
   const nextId = () => {
     idRef.current += 1;
@@ -246,6 +282,105 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
       }
       wireSkillsToRegistry(skillCatalogRef.current!, cmdRegistryRef.current!, null);
       setSlashCommands(cmdRegistryRef.current!.listCommands());
+      // day10：hook 配置一次性聚合校验（T10/F27）——错误以 system 消息上屏，
+      // 不阻塞启动，合法 hook 继续生效（F10/G10）。
+      const hookErr = validateHooks(hooks);
+      if (hookErr) {
+        appendMessage(
+          { id: nextId(), role: "system", content: `Hook warning: ${hookErr.message}` },
+          true,
+        );
+      }
+      hookEngineRef.current = new HookEngine(hooks);
+
+      // day11：SubAgent 接线（T13）——TaskManager / TeamManager / Agent 工具与
+      // 团队系列工具注册；后台任务完成后经 <task-notification> 回流主对话（F28）。
+      const taskMgr = new TaskManager();
+      taskMgrRef.current = taskMgr;
+      // day13（F56）：与管理器 ref 共享同一实例，工具注册 / AgentTool / 渲染层同源。
+      const teamMgr = teamManagerRef.current;
+
+      const spawnHandler = async (
+        def: AgentDefinition,
+        prompt: string,
+        background: boolean,
+        modelOverride?: string,
+      ) => {
+        const client = clientRef.current;
+        const provider = selectedProviderRef.current;
+        if (!client || !provider) throw new Error("LLM 客户端尚未就绪");
+        const spawn = () =>
+          spawnSubAgent(
+            def, prompt, client, toolRegistry, provider, workDir,
+            undefined, undefined, modelOverride, hookEngineRef.current ?? undefined,
+          );
+        if (background) {
+          const ctrl = new AbortController();
+          const task = taskMgr.create(def.name, spawn, () => ctrl.abort());
+          return JSON.stringify({ task_id: task.id, status: "async_launched" });
+        }
+        return await spawn();
+      };
+
+      const forkHandler = async (
+        forkedPrompt: string,
+        _conversation: ConversationManager,
+        _registry: ToolRegistry,
+        modelOverride?: string,
+      ) => {
+        const client = clientRef.current;
+        const provider = selectedProviderRef.current;
+        if (!client || !provider) throw new Error("LLM 客户端尚未就绪");
+        const ctrl = new AbortController();
+        const task = taskMgr.create(
+          "fork",
+          () =>
+            spawnSubAgent(
+              { name: "fork", description: "forked agent" }, forkedPrompt, client, toolRegistry,
+              provider, workDir, undefined, undefined, modelOverride, hookEngineRef.current ?? undefined,
+            ),
+          () => ctrl.abort(),
+        );
+        return JSON.stringify({ task_id: task.id, status: "async_launched" });
+      };
+
+      const agentTool = new AgentTool(workDir, toolRegistry, spawnHandler, convRef.current, forkHandler);
+      agentToolRef.current = agentTool;
+
+      const runAgentForTeammate = async (task: string, onEvent?: AgentEventSink) => {
+        const client = clientRef.current;
+        const provider = selectedProviderRef.current;
+        if (!client || !provider) throw new Error("LLM 客户端尚未就绪");
+        return await spawnSubAgent(BUILTIN_AGENTS[0]!, task, client, toolRegistry, provider, workDir, undefined, onEvent);
+      };
+      agentTool.setTeamManager(teamMgr, runAgentForTeammate);
+
+      toolRegistry.register(agentTool);
+      toolRegistry.register(new TeamCreateTool(teamMgr));
+      toolRegistry.register(new SpawnTeammateTool(teamMgr, runAgentForTeammate));
+      toolRegistry.register(new SendMessageTool(teamMgr));
+      toolRegistry.register(new ListTeamsTool(teamMgr));
+      toolRegistry.register(new TeamDeleteTool(teamMgr));
+
+      // 后台任务完成 → reminder 区 + 屏幕系统消息；seenTaskIds 去重避免重复推送（场景 10）。
+      const seenTaskIds = new Set<string>();
+      taskNotifyTimerRef.current = setInterval(() => {
+        for (const t of taskMgr.drainNotifications()) {
+          if (seenTaskIds.has(t.id)) continue;
+          seenTaskIds.add(t.id);
+          convRef.current.addSystemReminder(
+            `<task-notification>\nTask ${t.id} (name="${t.name}"): ${t.status}\nResult: ${t.output}\n</task-notification>`,
+          );
+          appendMessage(
+            {
+              id: nextId(),
+              role: "system",
+              content: `📋 Task ${t.id} (${t.name}) ${t.status}: ${t.output.slice(0, 200)}`,
+            },
+            true,
+          );
+        }
+      }, 1000);
     }
     const systemPrompt = buildSystemPrompt(env);
     createClient(selectedProvider, systemPrompt)
@@ -315,6 +450,21 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
     };
   }, [appState, selectedProvider, workDir, mcpServers]);
 
+  // day11：卸载时停掉任务通知轮询（App 退出路径）。
+  useEffect(() => {
+    return () => {
+      if (taskNotifyTimerRef.current) clearInterval(taskNotifyTimerRef.current);
+    };
+  }, []);
+
+  // day13（F58）：500ms 轮询管理器拷贝队员状态快照，驱动 Spinner Tree 实时刷新。
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTeammateStates(teamManagerRef.current.getAllTeammateStates());
+    }, 500);
+    return () => clearInterval(timer);
+  }, []);
+
   useInput((input, key) => {
     if (key.ctrl && input === "c") {
       // 流式态 Ctrl+C 中断本轮、回空闲态；空闲态退出程序（F7）。
@@ -335,6 +485,11 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
     // 用 state 判定：同一按键分发里 Dialog 可能先清 ref，state 闭包值在本次分发内不变。
     if (key.escape && isStreaming && permissionRequest === null) {
       abortControllerRef.current?.abort();
+      return;
+    }
+    // day13（F60）：Ctrl+T 切换 Teams Dialog（流式态也允许查看）。
+    if (key.ctrl && input === "t") {
+      setTeamsDialogOpen((open) => !open);
       return;
     }
   });
@@ -442,6 +597,8 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
     try {
       const checker = new PermissionChecker(workDir, permModeRef.current);
       if (checker.mode === "plan") checker.planFilePath = planPath;
+      // 会话恢复 / 重建后 convRef.current 可能被替换，派生前同步给 AgentTool（Fork 用父上下文）。
+      if (agentToolRef.current) agentToolRef.current.conversation = convRef.current;
       const provider = selectedProvider;
       const agent = new Agent({
         client,
@@ -456,6 +613,7 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
         recoveryState: recoveryStateRef.current,
         replacementState: replacementStateRef.current,
         sessionId: sessionIdRef.current,
+        hookEngine: hookEngineRef.current ?? undefined,
         onPermissionRequest: (toolName, args, decision) =>
           new Promise<"allow" | "deny" | "allowAlways">((resolve) => {
             // Agent 的 ask 决策桥到 Dialog：Promise 挂起等用户三选一（F10）。
@@ -498,7 +656,11 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
             });
         },
       });
-      for await (const ev of agent.run()) {
+      for await (const ev of agent.run({
+        // day13（F59）：Coordinator 软强制（Team 存在时收窄写类工具）+ 团队通知注入。
+        toolFilter: buildComposedToolFilter(coordinatorToolFilter(teamManagerRef.current), null),
+        notificationFn: () => teamManagerRef.current.drainLeads(),
+      })) {
         switch (ev.type) {
           case "stream_text":
             streamingTextRef.current += ev.text;
@@ -1033,6 +1195,9 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
       {isStreaming ? <Spinner inputTokens={inputTokens} outputTokens={outputTokens} iteration={iteration} /> : null}
       {!isStreaming && completionMark ? <Text color="green">{completionMark}</Text> : null}
       {error ? <Text color="red">{error}</Text> : null}
+      {teammateStates.length > 0 ? (
+        <TeammateSpinnerTree teammates={teammateStates} leaderTokens={inputTokens + outputTokens} />
+      ) : null}
       {permissionRequest ? (
         <PermissionDialog
           toolName={permissionRequest.toolName}
@@ -1069,6 +1234,23 @@ export function App({ providers, mcpServers, hooks }: AppProps) {
         inputTokens={inputTokens}
         outputTokens={outputTokens}
       />
+      <TeamStatus
+        count={teammateStates.filter((t) => t.status === "running" || t.status === "idle").length}
+      />
+      {teamsDialogOpen ? (
+        <TeamsDialog
+          teammates={teammateStates}
+          onClose={() => setTeamsDialogOpen(false)}
+          onKill={(name, teamName) => {
+            const team = teamManagerRef.current.get(teamName);
+            if (team) void team.stopMember(name);
+          }}
+          onShutdown={(name, teamName) => {
+            const team = teamManagerRef.current.get(teamName);
+            if (team) void team.sendMessage("lead", name, "[shutdown] Please finish and exit");
+          }}
+        />
+      ) : null}
     </Box>
   );
 }

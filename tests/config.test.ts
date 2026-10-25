@@ -147,7 +147,7 @@ describe("mergeConfig 与窗口推导", () => {
         { name: "home", protocol: "anthropic", base_url: "https://api.anthropic.com", model: "old" },
       ],
       mcp_servers: [{ name: "a", command: "old" }, { name: "b", command: "keep" }],
-      hooks: [{ event: "start", command: "echo a" }],
+      hooks: [{ event: "turn_start", action: { type: "prompt", prompt: "a" } }],
       permission_mode: "default",
     };
     const override: AppConfig = {
@@ -155,7 +155,7 @@ describe("mergeConfig 与窗口推导", () => {
         { name: "project", protocol: "openai", base_url: "https://api.openai.com/v1", model: "gpt-4o" },
       ],
       mcp_servers: [{ name: "a", command: "new" }],
-      hooks: [{ event: "end", command: "echo b" }],
+      hooks: [{ event: "session_end", action: { type: "command", command: "echo b" } }],
     };
     const merged = mergeConfig(base, override);
     expect(merged.providers.map((item) => item.name)).toEqual(["project"]);
@@ -163,6 +163,23 @@ describe("mergeConfig 与窗口推导", () => {
     expect(merged.mcp_servers.find((item) => item.name === "b")?.command).toBe("keep");
     expect(merged.hooks).toHaveLength(2);
     expect(merged.permission_mode).toBe("default");
+  });
+
+  test("appends hooks（day10 T12：后层 hooks 直接叠加，不按 id 覆盖）", () => {
+    const base: AppConfig = {
+      providers: [],
+      mcp_servers: [],
+      hooks: [{ id: "a", event: "turn_start", action: { type: "prompt", prompt: "请用中文回答" } }],
+    };
+    const override: AppConfig = {
+      providers: [],
+      mcp_servers: [],
+      hooks: [{ id: "a", event: "turn_start", action: { type: "prompt", prompt: "同 id 也追加" } }],
+    };
+    const result = mergeConfig(base, override);
+    expect(result.hooks).toHaveLength(2);
+    expect(result.hooks[0]?.id).toBe("a");
+    expect(result.hooks[1]?.id).toBe("a");
   });
 
   test("getMaxOutputTokens 与 getContextWindow 回退", () => {
@@ -260,6 +277,69 @@ providers:
 mcp_servers: not-a-list
 `);
     expect(() => loadConfig(path)).toThrow(ConfigError);
+  });
+});
+
+describe("hooks 配置（day10）", () => {
+  test("loadSingleFile 解析完整 HookConfig 字段（F2）", () => {
+    const path = writeYaml(`
+providers:
+  - name: p
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-3-5-sonnet
+hooks:
+  - id: block-write
+    event: pre_tool_use
+    condition: 'tool == "WriteFile"'
+    reject: true
+    once: false
+    on_error: reject
+    action:
+      type: command
+      command: "false"
+  - id: notify
+    event: post_receive
+    async: true
+    action:
+      type: http
+      url: "http://127.0.0.1:9999/recv"
+      method: POST
+`);
+    const config = loadConfig(path);
+    expect(config.hooks).toHaveLength(2);
+    expect(config.hooks[0]).toEqual({
+      id: "block-write",
+      event: "pre_tool_use",
+      condition: 'tool == "WriteFile"',
+      action: { type: "command", command: "false" },
+      reject: true,
+      on_error: "reject",
+    });
+    expect(config.hooks[1]).toEqual({
+      id: "notify",
+      event: "post_receive",
+      action: { type: "http", url: "http://127.0.0.1:9999/recv", method: "POST" },
+      async: true,
+    });
+  });
+
+  test("loadSingleFile 三层叠加后 hooks 全部生效（F1）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mewcode-config-"));
+    dirs.push(dir);
+    const provider = `
+providers:
+  - name: p
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-3-5-sonnet
+`;
+    writeFileSync(join(dir, "config.yaml"), `${provider}hooks:\n  - event: turn_start\n    action: {type: prompt, prompt: "1"}`);
+    writeFileSync(join(dir, "config.local.yaml"), `${provider}hooks:\n  - event: turn_end\n    action: {type: prompt, prompt: "2"}`);
+    const config = loadConfig(join(dir, "config.yaml"));
+    const local = loadConfig(join(dir, "config.local.yaml"));
+    const merged = mergeConfig(mergeConfig(config, { providers: [], mcp_servers: [], hooks: [] }), local);
+    expect(merged.hooks.map((h) => h.event)).toEqual(["turn_start", "turn_end"]);
   });
 });
 

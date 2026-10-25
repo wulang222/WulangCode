@@ -12,6 +12,7 @@ import { emptyUsage } from "../../src/llm/events.ts";
 import { ContextTooLongError } from "../../src/llm/errors.ts";
 import { RecoveryState } from "../../src/compact/recovery.ts";
 import { estimateMessages } from "../../src/compact/compact.ts";
+import { HookEngine } from "../../src/hooks/hooks.ts";
 import { PermissionChecker } from "../../src/permissions/checker.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import { ReadFileTool } from "../../src/tools/read-file.ts";
@@ -967,4 +968,201 @@ test("onLoopComplete 回调抛错不影响 loop 完结", async () => {
   );
   expect(events[events.length - 1]?.type).toBe("loop_complete");
   expect(conv.getMessages().length).toBe(2);
+});
+
+// ---------- day10：Hook 生命周期接入 ----------
+
+/** 记录权限检查调用次数的探针 checker：验证 hook 拦截时权限层完全未介入。 */
+class SpyChecker extends PermissionChecker {
+  checkCalls = 0;
+  override check(...args: Parameters<PermissionChecker["check"]>) {
+    this.checkCalls += 1;
+    return super.check(...args);
+  }
+}
+
+function writeFileCall(filePath: string, content: string, id: string): Script {
+  return [
+    { type: "tool_call_start", toolName: "WriteFile", toolId: id },
+    { type: "tool_call_complete", toolId: id, toolName: "WriteFile", arguments: { file_path: filePath, content } },
+    { type: "stream_end", stopReason: "tool_use", usage: emptyUsage() },
+  ];
+}
+
+/** 第 N 次请求视图里是否包含给定文本（system-reminder 只进请求视图不落历史，F25）。 */
+function requestIncludes(client: FakeLLMClient, call: number, text: string): boolean {
+  return (
+    client.receivedMessages[call]?.some((m) => typeof m.content === "string" && m.content.includes(text)) ?? false
+  );
+}
+
+test("surfaces lifecycle-hook output as a system reminder on the next turn（T13/AC1）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+  const filePath = join(dir, "note.txt");
+  writeFileSync(filePath, "content\n", "utf-8");
+
+  const engine = new HookEngine([{ event: "turn_start", action: { type: "prompt", prompt: "REMINDER_NOTE" } }]);
+  const client = scripted(readFileCall(filePath, "t1"), finalText("done"));
+  const conv = new Conv();
+  conv.addUserMessage("读文件");
+
+  await collect(
+    new Agent({
+      client,
+      registry: makeRegistry(),
+      checker: new PermissionChecker(dir, "bypassPermissions"),
+      conversation: conv,
+      workDir: dir,
+      hookEngine: engine,
+    }),
+  );
+
+  expect(client.streamCalls).toBe(2);
+  // 第 1 轮 turn_start hook 的输出，在第 2 轮请求视图里以 <system-reminder> 出现
+  expect(requestIncludes(client, 0, "REMINDER_NOTE")).toBe(false);
+  expect(requestIncludes(client, 1, "REMINDER_NOTE")).toBe(true);
+  expect(requestIncludes(client, 1, "<system-reminder>")).toBe(true);
+  // 第 2 轮自己的 turn_start 输出已入队、留给下一次 run 首轮消费（队列非空即活）
+  expect(engine.drainNotifications()).toEqual(["REMINDER_NOTE"]);
+});
+
+test("pre_tool_use hook 拦截 WriteFile：不进权限检查、文件未写、结果回灌模型（F16/AC2）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+  const target = join(dir, "hello.txt");
+
+  const engine = new HookEngine([
+    {
+      id: "block-write",
+      event: "pre_tool_use",
+      condition: 'tool == "WriteFile"',
+      reject: true,
+      on_error: "reject",
+      action: { type: "command", command: "echo 'blocked by hook policy' >&2; false" },
+    },
+  ]);
+  const registry = makeRegistry();
+  registry.register(new WriteFileTool());
+  const checker = new SpyChecker(dir, "bypassPermissions");
+  const client = scripted(writeFileCall(target, "hi", "w1"), finalText("被拦了"));
+  const conv = new Conv();
+  conv.addUserMessage("写文件");
+
+  const events = await collect(
+    new Agent({ client, registry, checker, conversation: conv, workDir: dir, hookEngine: engine }),
+  );
+
+  // 权限检查完全未介入（hook 拦截先于 checker.check）
+  expect(checker.checkCalls).toBe(0);
+  // 文件没有被写
+  expect(existsSync(target)).toBe(false);
+  // 拒绝原因作为带错误标记的工具结果回灌
+  const rejected = events.find(
+    (e): e is Extract<AgentEvent, { type: "tool_result" }> =>
+      e.type === "tool_result" && e.output.startsWith("Rejected by hook:"),
+  );
+  expect(rejected).toBeDefined();
+  expect(rejected?.isError).toBe(true);
+  expect(rejected?.output).toContain("blocked by hook policy");
+  expectHistoryValid(conv.getMessages());
+  // 第 2 轮请求里能看到被拒的 tool_result（内容在 toolResults 字段，下一轮 LLM 可见）
+  const round2ToolResults = client.receivedMessages[1]?.flatMap((m) => m.toolResults ?? []) ?? [];
+  expect(round2ToolResults.some((r) => r.content.includes("Rejected by hook:"))).toBe(true);
+});
+
+test("post_tool_use hook 在工具结果后触发、输出经通知队列进下一轮请求（F24）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+  const filePath = join(dir, "note.txt");
+  writeFileSync(filePath, "x", "utf-8");
+
+  const engine = new HookEngine([{ event: "post_tool_use", action: { type: "prompt", prompt: "TOOL_DONE" } }]);
+  const client = scripted(readFileCall(filePath, "t1"), finalText("done"));
+  const conv = new Conv();
+  conv.addUserMessage("读文件");
+
+  await collect(
+    new Agent({
+      client,
+      registry: makeRegistry(),
+      checker: new PermissionChecker(dir, "bypassPermissions"),
+      conversation: conv,
+      workDir: dir,
+      hookEngine: engine,
+    }),
+  );
+
+  expect(requestIncludes(client, 1, "TOOL_DONE")).toBe(true);
+});
+
+test("session_start + once：首次 run 注入首轮请求，同引擎第二次 run 不再注入（AC4/F19）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+
+  const engine = new HookEngine([
+    { id: "first-only", event: "session_start", once: true, action: { type: "prompt", prompt: "FIRST_ONLY" } },
+  ]);
+
+  const runOnce = async () => {
+    const client = scripted(finalText("done"));
+    const conv = new Conv();
+    conv.addUserMessage("hi");
+    await collect(
+      new Agent({
+        client,
+        registry: makeRegistry(),
+        checker: new PermissionChecker(dir, "bypassPermissions"),
+        conversation: conv,
+        workDir: dir,
+        hookEngine: engine,
+      }),
+    );
+    return client;
+  };
+
+  const first = await runOnce();
+  // session_start 在主循环之前 fire，首轮请求顶部即 drain 注入
+  expect(requestIncludes(first, 0, "FIRST_ONLY")).toBe(true);
+
+  const second = await runOnce();
+  expect(requestIncludes(second, 0, "FIRST_ONLY")).toBe(false);
+});
+
+test("session_end 在 run 收尾触发（finally 路径），输出留在通知队列（F4/T8-5）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+  const engine = new HookEngine([{ event: "session_end", action: { type: "prompt", prompt: "SESSION_ENDED" } }]);
+  const client = scripted(finalText("done"));
+  const conv = new Conv();
+  conv.addUserMessage("hi");
+
+  await collect(
+    new Agent({
+      client,
+      registry: makeRegistry(),
+      checker: new PermissionChecker(dir, "bypassPermissions"),
+      conversation: conv,
+      workDir: dir,
+      hookEngine: engine,
+    }),
+  );
+
+  const notes = engine.drainNotifications();
+  expect(notes).toContain("SESSION_ENDED");
+});
+
+test("无 hookEngine 时全部生命周期点为 no-op，主循环行为不变（N1）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "mewcode-agent-"));
+  const filePath = join(dir, "note.txt");
+  writeFileSync(filePath, "x", "utf-8");
+  const client = scripted(readFileCall(filePath, "t1"), finalText("done"));
+  const conv = new Conv();
+  conv.addUserMessage("读文件");
+  const events = await collect(
+    new Agent({
+      client,
+      registry: makeRegistry(),
+      checker: new PermissionChecker(dir, "bypassPermissions"),
+      conversation: conv,
+      workDir: dir,
+    }),
+  );
+  expect(client.streamCalls).toBe(2);
+  expect(events[events.length - 1]?.type).toBe("loop_complete");
 });
