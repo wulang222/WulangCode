@@ -1,4 +1,5 @@
 import type { UsageInfo } from "../llm/events.js";
+import type { CompactBoundaryPayload } from "../session/session.js";
 
 /** 协议无关的 Agent 事件：TUI 只消费这些，不感知底层协议。 */
 export type AgentEvent =
@@ -11,5 +12,6 @@ export type AgentEvent =
   | { type: "loop_complete"; stopReason: string }
   | { type: "usage"; usage: UsageInfo }
   | { type: "error"; error: Error }
+  | { type: "compact"; message: string; boundary?: CompactBoundaryPayload }
   | { type: "retry"; reason: string; delay: number }
   | { type: "permission_request"; toolName: string; args: Record<string, unknown> };

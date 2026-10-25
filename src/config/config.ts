@@ -27,9 +27,16 @@ export interface ProviderConfig {
 
 export interface MCPServerConfig {
   name: string;
+  /** stdio：本地命令本体 */
   command?: string;
   args?: string[];
+  /** http / sse：远程地址 */
   url?: string;
+  /** "sse" 选 SSE 长连接；缺省或其它值走 Streamable HTTP */
+  transport?: string;
+  /** http / sse：随每次请求注入的自定义头，值支持 ${VAR} / $VAR */
+  headers?: Record<string, string>;
+  /** stdio：注入子进程的环境变量，值支持 ${VAR} / $VAR */
   env?: Record<string, string>;
 }
 
@@ -138,6 +145,8 @@ function parseMCPServers(raw: unknown): MCPServerConfig[] {
       command: asString(row.command) || undefined,
       args: Array.isArray(row.args) ? row.args.map((part) => String(part)) : undefined,
       url: asString(row.url) || undefined,
+      transport: asString(row.transport) || undefined,
+      headers: asStringRecord(row.headers),
       env: asStringRecord(row.env),
     };
   });

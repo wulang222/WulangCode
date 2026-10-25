@@ -12,6 +12,7 @@ import {
   resolveAPIKey,
   _resetContextWindowCache,
   type AppConfig,
+  type MCPServerConfig,
   type ProviderConfig,
 } from "../src/config/config.ts";
 
@@ -199,3 +200,69 @@ describe("mergeConfig 与窗口推导", () => {
     expect(value).toBe(200_000);
   });
 });
+
+describe("mcp_servers 配置", () => {
+  test("三层 mergeConfig 链式合并：同名后层完整覆盖前层、保位，新名追加尾部（AC1）", () => {
+    const layer1 = emptyCfg([{ name: "github", command: "old-cmd", args: ["a"] }, { name: "keep", command: "keep-cmd" }]);
+    const layer2 = emptyCfg([{ name: "github", url: "https://mcp.github.com", headers: { Authorization: "Bearer ${GH_TOKEN}" } }]);
+    const layer3 = emptyCfg([{ name: "sqlite", command: "sqlite-server" }]);
+    const merged = mergeConfig(mergeConfig(layer1, layer2), layer3);
+    const names = merged.mcp_servers.map((server) => server.name);
+    expect(names).toEqual(["github", "keep", "sqlite"]);
+    // 完整覆盖：command/args 没有残留前层字段
+    expect(merged.mcp_servers[0]).toEqual({
+      name: "github",
+      url: "https://mcp.github.com",
+      headers: { Authorization: "Bearer ${GH_TOKEN}" },
+    });
+    expect(merged.mcp_servers[1]?.command).toBe("keep-cmd");
+  });
+
+  test("loadSingleFile 解析 transport / headers / env / args（AC2/F2）", () => {
+    const path = writeYaml(`
+providers:
+  - name: p
+    protocol: openai-compat
+    base_url: https://example.com
+    model: m
+mcp_servers:
+  - name: remote-sse
+    url: https://sse.example.com/mcp
+    transport: sse
+    headers:
+      Authorization: "Bearer \${TOKEN}"
+  - name: local
+    command: npx
+    args: ["-y", "some-server"]
+    env:
+      GITHUB_TOKEN: "\${GITHUB_TOKEN}"
+`);
+    const config = loadConfig(path);
+    expect(config.mcp_servers.length).toBe(2);
+    expect(config.mcp_servers[0]).toEqual({
+      name: "remote-sse",
+      url: "https://sse.example.com/mcp",
+      transport: "sse",
+      headers: { Authorization: "Bearer ${TOKEN}" },
+    });
+    expect(config.mcp_servers[1]?.command).toBe("npx");
+    expect(config.mcp_servers[1]?.args).toEqual(["-y", "some-server"]);
+    expect(config.mcp_servers[1]?.env).toEqual({ GITHUB_TOKEN: "${GITHUB_TOKEN}" });
+  });
+
+  test("mcp_servers 非 list 抛 ConfigError（进程退出路径）", () => {
+    const path = writeYaml(`
+providers:
+  - name: p
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    model: claude-3-5-sonnet
+mcp_servers: not-a-list
+`);
+    expect(() => loadConfig(path)).toThrow(ConfigError);
+  });
+});
+
+function emptyCfg(mcp_servers: MCPServerConfig[]): AppConfig {
+  return { providers: [], mcp_servers, hooks: [] };
+}

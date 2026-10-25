@@ -22,6 +22,10 @@ export interface Tool {
   name: string;
   description: string;
   category: ToolCategory;
+  /** 延迟加载：默认不进系统提示词的工具清单，标记 discovered 后才进入（MCP 工具用）。 */
+  deferred?: boolean;
+  /** 系统内置的框架级工具（如 ToolSearch），不参与用户侧工具统计。 */
+  system?: boolean;
   schema(): Record<string, unknown>;
   execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }

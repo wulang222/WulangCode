@@ -1,5 +1,8 @@
 node_modules/
 .mewcode/config.yaml
 .mewcode/config.local.yaml
+.mewcode/permissions.local.yaml
 *.log
 dist/
+.mewcode/sessions/
+.mewcode/tool_results/

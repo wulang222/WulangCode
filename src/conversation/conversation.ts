@@ -88,15 +88,41 @@ export class ConversationManager {
     this.pendingReminders = [];
   }
 
-  /** 长期记忆只注入一次。本章不调用。 */
-  injectLongTermMemory(content: string): void {
-    if (this.ltmInjected || !content.trim()) return;
-    this.history.unshift({ role: "system", content });
+  /**
+   * 长期记忆一次性注入（F8/F27）：项目指令（# mewcodeMd）+ 记忆摘要（# autoMemory）
+   * + 当日日期（# currentDate）三段非空拼装，外包 <system-reminder> 写到首条 user 消息；
+   * ltmInjected 守门保证每个实例最多注入一次（F37），恢复会话新建实例自然重注。
+   */
+  injectLongTermMemory(instructions: string, memories: string): void {
+    if (this.ltmInjected) return;
+    const sections: string[] = [];
+    if (instructions.trim()) sections.push(`# mewcodeMd\n\n${instructions.trim()}`);
+    if (memories.trim()) sections.push(`# autoMemory\n\n${memories.trim()}`);
+    const today = new Date().toISOString().split("T")[0] ?? "";
+    if (today) sections.push(`# currentDate\n\n${today}`);
+    if (sections.length === 0) return;
+    const wrapped =
+      `<system-reminder>\n` +
+      `As you answer the user's questions, you can use the following context:\n\n` +
+      `${sections.join("\n\n")}\n\n` +
+      `IMPORTANT: this context may or may not be relevant to your tasks. Do not respond to this context unless highly relevant to your task.\n` +
+      `</system-reminder>`;
+    this.history.unshift({ role: "user", content: wrapped });
     this.ltmInjected = true;
   }
 
-  replaceWithCompacted(messages: Message[]): void {
-    this.history = messages.map((message) => ({ ...message }));
+  /** 原样回放一条消息（system 等无法用语义方法表达的历史项走这里）。 */
+  addRawMessage(message: Message): void {
+    this.history.push({ ...message });
+  }
+
+  /**
+   * 压缩后整体替换（第 2 层）：摘要 user 消息 + verbatim 尾部。
+   * keep 切片由调用方保证一致性，不做额外深拷贝；verbatim 尾部首条
+   * 大多数情况下是 assistant，provider 对开头的 user/user 相邻已放宽。
+   */
+  replaceWithCompacted(summaryContent: string, keep: Message[]): void {
+    this.history = [{ role: "user", content: summaryContent }, ...keep];
   }
 
   getMessages(): Message[] {

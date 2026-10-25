@@ -9,6 +9,11 @@ providers:
     model: claude-sonnet-4-5
     api_key: <your-key> # 也可改为 ANTHROPIC_API_KEY 环境变量
     thinking: true
+    # 可选：显式指定上下文窗口（token）。不配置时按协议默认
+    # anthropic 200000 / openai 128000，再叠加模型表与在线探测回退。
+    context_window: 200000
+    # 可选：单次最大输出 token（默认 8192；开 thinking 时 64000）。
+    max_output_tokens: 8192
 
 
 
@@ -17,3 +22,21 @@ providers:
     base_url: https://api.example.com/v1
     model: gpt-4o
     api_key: <your-key> # 也可改为 OPENAI_API_KEY 环境变量
+
+# MCP servers：三种传输方式。密钥一律用 ${VAR} / $VAR 引用宿主环境变量，不落盘。
+mcp_servers:
+  # 本地 stdio：command + args + env
+  - name: everything
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+  # 远程 Streamable HTTP（默认）：url + headers
+  - name: github
+    url: https://api.githubcopilot.com/mcp
+    headers:
+      Authorization: "Bearer ${GITHUB_TOKEN}"
+  # 远程 SSE 长连接：显式 transport: sse
+  - name: legacy-sse
+    url: https://mcp.example.com/sse
+    transport: sse
+    headers:
+      Authorization: "Bearer $LEGACY_TOKEN"

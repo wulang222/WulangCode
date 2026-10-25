@@ -96,3 +96,40 @@ test("空提醒被忽略", () => {
   conv.addSystemReminder("   ");
   expect(conv.getRequestMessages().length).toBe(1);
 });
+
+// ---------- ch08：压缩后整体替换（T30/C6） ----------
+
+test("replaceWithCompacted：摘要 user 消息 + verbatim 尾部", () => {
+  const conv = new ConversationManager();
+  conv.addUserMessage("旧问题一");
+  conv.addAssistantMessage("旧回答一");
+  conv.addUserMessage("旧问题二");
+  const keep = [
+    { role: "assistant" as const, content: "近期回答" },
+    { role: "user" as const, content: "近期问题" },
+  ];
+  conv.replaceWithCompacted("SUMMARY", keep);
+  const messages = conv.getMessages();
+  expect(messages.length).toBe(3);
+  expect(messages[0]!.role).toBe("user");
+  expect(messages[0]!.content).toBe("SUMMARY");
+  expect(messages[1]!.content).toBe("近期回答");
+  expect(messages[2]!.content).toBe("近期问题");
+});
+
+test("replaceWithCompacted：keep 为空数组时仅剩摘要消息", () => {
+  const conv = new ConversationManager();
+  conv.addUserMessage("a");
+  conv.addAssistantMessage("b");
+  conv.replaceWithCompacted("ONLY SUMMARY", []);
+  expect(conv.len()).toBe(1);
+  expect(conv.getMessages()[0]!.content).toBe("ONLY SUMMARY");
+});
+
+test("replaceWithCompacted 不复制 keep：调用方切片即最终形态", () => {
+  const conv = new ConversationManager();
+  const keep = [{ role: "user" as const, content: "x" }];
+  conv.replaceWithCompacted("S", keep);
+  keep[0]!.content = "mutated";
+  expect(conv.getMessages()[1]!.content).toBe("mutated");
+});

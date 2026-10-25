@@ -1,0 +1,18 @@
+✓ 失败隔离：broken 进 errors
+✓ 可用 server 完成 connect + listTools
+✓ 握手 instructions 收集
+✓ AC6：注册后 deferred 工具默认不进工具清单
+✓ F9：未激活清单包含该工具
+✓ AC7：关键词检索返回名称与描述且不激活
+✓ AC7：select 返回 schema JSON 并激活
+✓ AC6：激活后工具进入清单
+✓ AC12：openai 协议包成 function 形态
+✓ Agent 闭环：echo 调用结果回灌
+✓ AC13：default 模式下 MCP 工具触发 HITL ask
+✓ ToolSearch 属 read 类不触发 HITL
+✓ F10：请求视图含 server instructions 提醒
+✓ 第一轮工具清单：已激活的在、未激活的不在
+✓ AC13：bypassPermissions 下 MCP 工具放行
+✓ disconnectAll 后 client 清空
+
+SMOKE PASS

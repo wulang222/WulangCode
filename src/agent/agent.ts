@@ -1,28 +1,33 @@
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import type { ConversationManager, ThinkingBlock, ToolResultBlock, ToolUseBlock } from "../conversation/conversation.js";
+import type { ConversationManager, ThinkingBlock, ToolUseBlock } from "../conversation/conversation.js";
 import type { LLMClient } from "../llm/client.js";
-import { isAbortError } from "../llm/errors.js";
+import { ContextTooLongError, isAbortError } from "../llm/errors.js";
 import type { Decision, PermissionChecker } from "../permissions/checker.js";
 import { buildPlanModeReminder } from "../prompt/plan-mode.js";
+import {
+  AutoCompactTrackingState,
+  forceCompact,
+  manageContext,
+  type UsageAnchor,
+} from "../compact/compact.js";
+import { RecoveryState } from "../compact/recovery.js";
+import { ContentReplacementState } from "../toolresult/state.js";
+import { applyBudget } from "../toolresult/budget.js";
+import { buildManager } from "../toolresult/reconstruct.js";
+import { toToolResultBlocks } from "../toolresult/record.js";
+import { getSessionFilePath } from "../session/session.js";
 import type { ToolCategory } from "../tools/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { AgentEvent } from "./events.js";
 import { StreamingExecutor, type ExecutedCall } from "./streaming-executor.js";
 
-/** Agent 层对单个工具结果的字符级兜底截断（N4）。 */
-const MAX_OUTPUT_CHARS = 10000;
-
 /** 连续只请求未注册工具的停止阈值（内置常量，不配置化）。 */
 const MAX_CONSECUTIVE_UNKNOWN = 3;
 
-/** plan 模式未显式指定计划文件时的默认路径（相对工作目录）。 */
-export const DEFAULT_PLAN_PATH = ".mewcode/plan.md";
-
-function truncateOutput(output: string): string {
-  if (output.length <= MAX_OUTPUT_CHARS) return output;
-  return `${output.slice(0, MAX_OUTPUT_CHARS)}\n… (output truncated)`;
-}
+/** plan 模式未显式指定计划文件时的默认路径（须落在 .mewcode/plans/ 内以享 Layer 0 豁免）。 */
+export const DEFAULT_PLAN_PATH = ".mewcode/plans/plan.md";
 
 export interface AgentConfig {
   client: LLMClient;
@@ -31,20 +36,35 @@ export interface AgentConfig {
   conversation: ConversationManager;
   workDir: string;
   abortSignal?: AbortSignal;
+  /** 上下文窗口（token），未配置按 Anthropic 风格默认 200000（F31/I11）。 */
+  contextWindow?: number;
+  /** 单次最大输出 token，默认 8192。 */
+  maxOutput?: number;
+  /** 压缩恢复段数据源；TUI 与 Agent 共享同一实例（/compact 手动路径）。 */
+  recoveryState?: RecoveryState;
+  /** 第 1 层替换决策账本；会话级单例。 */
+  replacementState?: ContentReplacementState;
+  /** 会话 id：用于压缩摘要里指回完整会话文件与 boundary 持久化。 */
+  sessionId?: string;
   /** 已激活 Skill（名 → SOP 正文）；空/缺省不注入，本章预留同一补充消息通道。 */
   activeSkills?: Map<string, string>;
   /** 迭代上限，0 表示不限（默认）。 */
   maxIterations?: number;
-  /** ask 决策的回调（本章占位，checker 不会产生 ask）。 */
+  /** ask 决策的人在回路回调；返回 allow / deny / allowAlways 三选一。 */
   onPermissionRequest?: (
     toolName: string,
     args: Record<string, unknown>,
     decision: Decision,
   ) => Promise<"allow" | "deny" | "allowAlways">;
+  /** loop 自然结束回调（后台记忆提取等宿主任务入口）；同步执行、异常被吞掉。 */
+  onLoopComplete?: (conversation: ConversationManager) => void;
 }
 
-function isToolResultEvent(event: AgentEvent): event is Extract<AgentEvent, { type: "tool_result" }> {
-  return event.type === "tool_result";
+/** 从请求 schema 列表提取工具名清单：与 tools 参数严格同源（F17）。 */
+function toolSchemaNamesOf(toolSchemas: Record<string, unknown>[]): string[] {
+  return toolSchemas
+    .map((s) => String((s as { name?: string }).name ?? ""))
+    .filter(Boolean);
 }
 
 /**
@@ -53,15 +73,42 @@ function isToolResultEvent(event: AgentEvent): event is Extract<AgentEvent, { ty
  * 都保证对话历史配对合法，会话可继续。
  */
 export class Agent {
-  constructor(private readonly config: AgentConfig) {}
+  private readonly contextWindow: number;
+  private readonly maxOutput: number;
+  private readonly recoveryState: RecoveryState;
+  private readonly replacementState: ContentReplacementState;
+  private readonly sessionFilePath: string;
+  private readonly compactTracking = new AutoCompactTrackingState();
+  private usageAnchor: UsageAnchor | null = null;
+
+  constructor(private readonly config: AgentConfig) {
+    this.contextWindow = config.contextWindow ?? 200_000;
+    this.maxOutput = config.maxOutput ?? 8192;
+    this.recoveryState = config.recoveryState ?? new RecoveryState();
+    this.replacementState = config.replacementState ?? new ContentReplacementState();
+    this.sessionFilePath = config.sessionId ? getSessionFilePath(config.workDir, config.sessionId) : "";
+  }
+
+  /** 测试探针：读当前估算锚点（验证替换不累加）。 */
+  _testGetUsageAnchor(): UsageAnchor | null {
+    return this.usageAnchor;
+  }
 
   async *run(): AsyncGenerator<AgentEvent> {
     const { client, registry, checker, conversation, workDir, abortSignal } = this.config;
     const maxIterations = this.config.maxIterations ?? 0;
     const toolSchemas = registry.getAllSchemas();
+    // 恢复段工具清单与本次请求 tools 严格同源（F17）。
+    const toolSchemaNames = toolSchemaNamesOf(toolSchemas);
+    // 已激活技能登记进恢复段：压缩后技能 SOP 仍可还原（F15）。
+    if (this.config.activeSkills) {
+      for (const [name, body] of this.config.activeSkills) this.recoveryState.recordSkillInvocation(name, body);
+    }
     let iteration = 0;
     let consecutiveUnknown = 0;
     let looping = true;
+    // 紧急自愈每次 run 只做一次：二次撞墙说明问题不在总量，按错误上抛（F26）。
+    let emergencyCompacted = false;
 
     while (looping) {
       iteration += 1;
@@ -74,6 +121,21 @@ export class Agent {
         yield { type: "loop_complete", stopReason: "interrupted" };
         return;
       }
+
+      // ---- 第 2 层：每轮请求前做上下文预算检查（自动压缩 / 熔断）----
+      const mc = await manageContext(
+        conversation,
+        client,
+        this.contextWindow,
+        this.maxOutput,
+        this.compactTracking,
+        this.recoveryState,
+        toolSchemaNames,
+        this.usageAnchor,
+        this.sessionFilePath,
+      );
+      if (mc.message) yield { type: "compact", message: mc.message, boundary: mc.boundary };
+      if (mc.compacted) this.usageAnchor = null;
 
       // Plan Mode：每轮注入计划态提醒（首轮完整，之后精简，每 5 轮重复完整版）。
       if (checker.mode === "plan") {
@@ -91,8 +153,12 @@ export class Agent {
       const toolUses: ToolUseBlock[] = [];
       let stopReason = "end_turn";
 
+      // ---- 第 1 层：请求视图过预算（单条/聚合落盘 + 旧轮次裁剪）后重建 apiConv（F6） ----
+      const apiConv = buildManager(applyBudget(conversation.getRequestMessages(), workDir, this.replacementState));
+      const sentMessageCount = conversation.len();
+
       try {
-        const stream = client.stream(conversation, toolSchemas, abortSignal);
+        const stream = client.stream(apiConv, toolSchemas, abortSignal);
         try {
           for await (const event of stream) {
             switch (event.type) {
@@ -113,6 +179,15 @@ export class Agent {
                 break;
               case "stream_end":
                 stopReason = event.stopReason;
+                // 估算锚点用最近一次真实 usage 替换（不累加），锚定发送时条数（F13/F14）。
+                this.usageAnchor = {
+                  baselineTokens:
+                    event.usage.inputTokens +
+                    event.usage.cacheReadInputTokens +
+                    event.usage.cacheCreationInputTokens +
+                    event.usage.outputTokens,
+                  anchorCount: sentMessageCount,
+                };
                 yield { type: "usage", usage: event.usage };
                 break;
               default:
@@ -129,7 +204,32 @@ export class Agent {
           yield { type: "loop_complete", stopReason: "interrupted" };
           return;
         }
-        yield { type: "error", error: err instanceof Error ? err : new Error(String(err)) };
+        const e = err instanceof Error ? err : new Error(String(err));
+        // 撞上下文上限：紧急压缩一次后用新消息列表重试本轮（F25/F26）。
+        if (e instanceof ContextTooLongError && !emergencyCompacted) {
+          emergencyCompacted = true;
+          try {
+            const result = await forceCompact(
+              conversation,
+              client,
+              this.recoveryState,
+              toolSchemaNames,
+              this.sessionFilePath,
+              this.contextWindow,
+            );
+            this.usageAnchor = null;
+            yield {
+              type: "compact",
+              message: "Auto-compacted due to context length: " + result.message,
+              boundary: result.boundary,
+            };
+            continue;
+          } catch {
+            yield { type: "error", error: e };
+            return;
+          }
+        }
+        yield { type: "error", error: e };
         return;
       }
 
@@ -145,6 +245,12 @@ export class Agent {
         conversation.addAssistantFull(fullText, thinkingBlocks, []);
         looping = false;
         yield { type: "loop_complete", stopReason };
+        // 宿主回调（day8 后台记忆提取）：异常吞掉，不影响 stream 完结。
+        try {
+          this.config.onLoopComplete?.(conversation);
+        } catch {
+          // 回调失败与主循环无关
+        }
         continue;
       }
 
@@ -156,13 +262,13 @@ export class Agent {
         return;
       }
 
+      // ReadFile 成功后用磁盘纯净字节登记恢复段（F19/F19a）：在结果回灌前完成，
+      // 保证下一次 manageContext 能观察到本轮读档。
+      await this.recordReadFiles(toolUses, events);
+
       // assistant 回合与工具结果一起落库：任何后续退出路径都保持配对合法（F6）。
       conversation.addAssistantFull(fullText, thinkingBlocks, toolUses);
-      const toolResults: ToolResultBlock[] = [];
-      for (const event of events) {
-        if (!isToolResultEvent(event)) continue;
-        toolResults.push({ toolUseId: event.toolId, content: event.output, isError: event.isError });
-      }
+      const toolResults = toToolResultBlocks(events);
       conversation.addToolResultsMessage(toolResults);
       for (const event of events) yield event;
 
@@ -197,6 +303,33 @@ export class Agent {
   }
 
   /**
+   * ReadFile 成功结果 → 恢复段登记（F19）：用磁盘原始字节（不带行号前缀）
+   * 重新读一次；失败静默跳过，不影响主循环。
+   */
+  private async recordReadFiles(toolUses: ToolUseBlock[], events: AgentEvent[]): Promise<void> {
+    for (const r of events) {
+      if (r.type !== "tool_result" || r.isError) continue;
+      const tu = toolUses.find((u) => u.toolUseId === r.toolId);
+      if (!tu) continue;
+      if (tu.toolName !== "ReadFile" && tu.toolName !== "Read" && tu.toolName !== "read_file") continue;
+      const raw =
+        typeof tu.arguments.file_path === "string"
+          ? tu.arguments.file_path
+          : typeof tu.arguments.path === "string"
+            ? tu.arguments.path
+            : "";
+      if (!raw) continue;
+      const path = isAbsolute(raw) ? raw : resolve(this.config.workDir, raw);
+      try {
+        const content = await readFile(path, "utf-8");
+        this.recoveryState.recordFileRead(path, content);
+      } catch {
+        // 读不到就跳过：恢复段只收确实可读的快照
+      }
+    }
+  }
+
+  /**
    * 保序分批执行（F5）：按模型给出的顺序扫描，连续只读合并为一个并发批，
    * 遇到写入/命令则先收尾当前只读批、再单独串行执行，不跨批重排。
    */
@@ -227,10 +360,16 @@ export class Agent {
     return this.config.registry.get(toolName)?.category ?? "command";
   }
 
+  /** deny 回灌给模型的统一安全话术：讲清被拒 + 不复述命令行为（F11）。 */
+  private static deniedOutput(reason: string): string {
+    return `Permission denied: ${reason}. 此操作已被安全策略拦截和阻止，请告知用户该命令被拒绝，不要描述该命令会做什么。`;
+  }
+
   /**
    * 执行一批工具调用。parallel=true 时全部 submit 后 Promise.all 并发收；
    * 否则逐个 submit / collect 串行。结果按模型调用顺序返回。
-   * 权限 deny / ask 拒绝的调用转成 isError 结果，不执行。
+   * 权限判定在 submit 前介入：deny / ask 拒绝的调用转成结构化 isError 结果回灌，
+   * 不执行也不中断循环；同批中被拒的与放行的各自独立、按原调用序配对（F11/N3）。
    */
   private async executeBatch(toolUses: ToolUseBlock[], parallel: boolean): Promise<AgentEvent[]> {
     const { registry, checker, workDir, abortSignal, onPermissionRequest } = this.config;
@@ -240,35 +379,42 @@ export class Agent {
     for (let index = 0; index < toolUses.length; index += 1) {
       const tu = toolUses[index]!;
       const decision = checker.check(tu.toolName, this.categoryOf(tu.toolName), tu.arguments);
-      if (decision.effect === "allow") {
-        executor.submit(tu.toolUseId, tu.toolName, tu.arguments);
-        if (!parallel) {
-          const [call] = await executor.collectResults();
-          if (call) outcomes[index] = this.processToolResult(call);
+      let deniedOutput = "";
+
+      if (decision.effect === "deny") {
+        deniedOutput = Agent.deniedOutput(decision.reason);
+      } else if (decision.effect === "ask") {
+        if (onPermissionRequest) {
+          outcomes[index] = { type: "permission_request", toolName: tu.toolName, args: tu.arguments };
+          const answer = await onPermissionRequest(tu.toolName, tu.arguments, decision);
+          if (answer === "deny") {
+            deniedOutput = "Permission denied by user";
+          } else {
+            if (answer === "allowAlways") checker.allowAlways(tu.toolName, tu.arguments);
+          }
+        } else {
+          // ask 无人在回路入口：按最严处理回灌拒绝，不放行（N7）。
+          deniedOutput = Agent.deniedOutput(decision.reason);
         }
+      }
+
+      if (deniedOutput !== "") {
+        outcomes[index] = {
+          type: "tool_result",
+          toolName: tu.toolName,
+          toolId: tu.toolUseId,
+          output: deniedOutput,
+          isError: true,
+          elapsed: 0,
+        };
         continue;
       }
-      if (decision.effect === "ask" && onPermissionRequest) {
-        outcomes[index] = { type: "permission_request", toolName: tu.toolName, args: tu.arguments };
-        const answer = await onPermissionRequest(tu.toolName, tu.arguments, decision);
-        if (answer === "allow" || answer === "allowAlways") {
-          if (answer === "allowAlways") checker.allowAlways(tu.toolName, tu.arguments);
-          executor.submit(tu.toolUseId, tu.toolName, tu.arguments);
-          if (!parallel) {
-            const [call] = await executor.collectResults();
-            if (call) outcomes[index] = this.processToolResult(call);
-          }
-          continue;
-        }
+
+      executor.submit(tu.toolUseId, tu.toolName, tu.arguments);
+      if (!parallel) {
+        const [call] = await executor.collectResults();
+        if (call) outcomes[index] = this.processToolResult(call);
       }
-      outcomes[index] = {
-        type: "tool_result",
-        toolName: tu.toolName,
-        toolId: tu.toolUseId,
-        output: truncateOutput(`Permission denied${decision.reason ? `: ${decision.reason}` : ""}`),
-        isError: true,
-        elapsed: 0,
-      };
     }
 
     if (parallel) {
@@ -282,13 +428,13 @@ export class Agent {
     return outcomes.filter((event): event is AgentEvent => event !== undefined);
   }
 
-  /** 本章只做截断与字段转换；后续章节在此接 file snapshot / hooks。 */
+  /** 字段转换；超大结果的落盘与裁剪由第 1 层 applyBudget 统一接管。 */
   private processToolResult(call: ExecutedCall): AgentEvent {
     return {
       type: "tool_result",
       toolName: call.toolName,
       toolId: call.toolId,
-      output: truncateOutput(call.result.output),
+      output: call.result.output,
       isError: call.result.isError,
       elapsed: call.elapsed,
     };

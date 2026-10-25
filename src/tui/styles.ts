@@ -24,8 +24,12 @@ export const symbols = {
   dot: "·",
 };
 
+/** 命令类型图标（day9 T7）：local/local_ui ⚙、skill_fork ★、prompt ◇。 */
 export const commandIcons: Record<string, string> = {
-  exit: symbols.cross,
+  local: "⚙",
+  local_ui: "⚙",
+  skill_fork: "★",
+  prompt: "◇",
 };
 
 export const borderColors = {
